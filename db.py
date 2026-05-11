@@ -5,14 +5,20 @@ Collections:
     messages : { username, role, content, timestamp }
 """
 
+import os
 import hashlib
 from datetime import datetime, timezone
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import ConnectionFailure, DuplicateKeyError
+from dotenv import load_dotenv
+
+# Load secrets from .env
+load_dotenv()
 
 # ── Connection ────────────────────────────────────────────────────────────────
-MONGO_URI = "mongodb+srv://she:1234@cluster0.dtuaa.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
-DB_NAME   = "Chat_db"
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+DB_NAME = os.getenv("DB_NAME", "Chat_db")
+
 
 def _get_db():
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
