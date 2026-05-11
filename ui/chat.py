@@ -16,6 +16,12 @@ def render_chat() -> None:
         st.session_state.stop_generation = False
     if "input_text" not in st.session_state:
         st.session_state.input_text = ""
+    if "clear_input_text" not in st.session_state:
+        st.session_state.clear_input_text = False
+
+    if st.session_state.clear_input_text:
+        st.session_state.input_text = ""
+        st.session_state.clear_input_text = False
 
     _render_sidebar()
     _render_header()
@@ -44,13 +50,18 @@ def render_chat() -> None:
         ollama_msgs = [
             {"role": m["role"], "content": m["content"]}
             for m in history[-OLLAMA_CONTEXT_TURNS:]
+            if m["role"] in {"user", "assistant"}
         ] + [{"role": "user", "content": pending}]
 
         reply, was_stopped = _stream_response(ollama_msgs)
         
-        # Only save if we got a response
+        # Save full replies normally, but keep stopped replies out of model context
         if reply.strip():
-            save_message(st.session_state.username, "assistant", reply)
+            save_message(
+                st.session_state.username,
+                "assistant_partial" if was_stopped else "assistant",
+                reply,
+            )
         
         # Reset flag and show input box
         st.session_state.stop_generation = False
@@ -150,10 +161,17 @@ def _render_bubble(msg: dict) -> None:
     content      = msg["content"]
     ts           = format_ts(msg.get("timestamp", ""))
     is_user      = role == "user"
+    is_broken    = role == "assistant_partial"
     av_class     = "user" if is_user else "bot"
     av_label     = st.session_state.username[:2].upper() if is_user else "AI"
     bubble_class = "user" if is_user else "bot"
     row_class    = "user" if is_user else ""
+
+    if is_broken:
+        content = (
+            "<div style='margin-bottom:8px;font-family:var(--mono);font-size:0.68rem;color:var(--muted);'>broken response</div>"
+            f"<div style='opacity:0.82;'>{content}</div>"
+        )
 
     st.markdown(f"""
     <div class='msg-row {row_class}'>
@@ -180,7 +198,8 @@ def _render_all_messages(history: list[dict], inject_user_msg: str | None = None
         """, unsafe_allow_html=True)
     else:
         for msg in history:
-            _render_bubble(msg)
+            if msg["role"] in {"user", "assistant", "assistant_partial"}:
+                _render_bubble(msg)
         # Inject the in-flight user bubble — appears on the RIGHT immediately
         if inject_user_msg:
             _render_bubble({
@@ -201,28 +220,27 @@ def _render_input_box() -> None:
     This custom box sits naturally below the messages in DOM order.
     """
     st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-
-    col_input, col_btn = st.columns([8, 1])
-
     def _submit_prompt() -> None:
         prompt = st.session_state.get("input_text", "").strip()
         if not prompt:
             return
         st.session_state.pending_prompt = prompt
         st.session_state.stop_generation = False
-        st.session_state.input_text = ""
+        st.session_state.clear_input_text = True
 
-    with col_input:
-        user_text = st.text_input(
-            label="chat_input",
-            label_visibility="collapsed",
-            placeholder="Ask Mistral anything…",
-            key="input_text",
-            on_change=_submit_prompt,
-        )
+    with st.form("chat_input_form", clear_on_submit=False):
+        col_input, col_btn = st.columns([8, 1])
 
-    with col_btn:
-        st.button("➤", key="send_btn", use_container_width=True, on_click=_submit_prompt)
+        with col_input:
+            st.text_input(
+                label="chat_input",
+                label_visibility="collapsed",
+                placeholder="Ask Mistral anything…",
+                key="input_text",
+            )
+
+        with col_btn:
+            st.form_submit_button("➤", use_container_width=True, on_click=_submit_prompt)
 
 
 # ── Streaming / animation ─────────────────────────────────────────────────────
@@ -297,16 +315,13 @@ def _stream_response(ollama_msgs: list[dict]) -> tuple[str, bool]:
 
     final_text = " ".join(shown)
     if stopped:
-        final_text += (
-            " <span style='font-family:var(--mono);font-size:0.7rem;"
-            "color:var(--muted);'>[stopped]</span>"
-        )
+        final_text = final_text.strip()
 
     placeholder.markdown(f"""
     <div class='msg-row'>
         <div class='avatar bot'>AI</div>
         <div class='bubble bot'>
-            {final_text}
+            {final_text if final_text else "<span style='font-family:var(--mono);font-size:0.7rem;color:var(--muted);'>broken response</span>"}
             <span class='ts'>{ts}</span>
         </div>
     </div>

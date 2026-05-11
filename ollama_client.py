@@ -49,20 +49,49 @@ def query_streaming(messages: list[dict], should_stop_func=None):
             stream=True
         )
         response.raise_for_status()
-        
-        for line in response.iter_lines():
-            # Check if we should stop
+        buffer = b""
+
+        for raw_chunk in response.iter_content(chunk_size=64):
             if should_stop_func and should_stop_func():
                 response.close()
                 return
-            
-            if line:
-                try:
-                    chunk = json.loads(line)
-                    if "message" in chunk and "content" in chunk["message"]:
-                        yield chunk["message"]["content"]
-                except Exception:
-                    pass
+
+            if not raw_chunk:
+                continue
+
+            buffer += raw_chunk
+
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                line = line.strip()
+
+                if should_stop_func and should_stop_func():
+                    response.close()
+                    return
+
+                if line:
+                    try:
+                        line_text = line.decode("utf-8", errors="ignore")
+                        if not line_text:
+                            continue
+                        chunk = json.loads(line_text)
+                        if "message" in chunk and "content" in chunk["message"]:
+                            yield chunk["message"]["content"]
+                    except Exception:
+                        pass
+
+        tail = buffer.strip()
+        if tail and not (should_stop_func and should_stop_func()):
+            try:
+                tail_text = tail.decode("utf-8", errors="ignore")
+                if tail_text:
+                    chunk = json.loads(tail_text)
+                else:
+                    chunk = None
+                if "message" in chunk and "content" in chunk["message"]:
+                    yield chunk["message"]["content"]
+            except Exception:
+                pass
     except requests.exceptions.ConnectionError:
         yield "⚠️ **Ollama is not running.**\n\nStart it with:\n```\nollama serve\n```"
     except requests.exceptions.Timeout:
