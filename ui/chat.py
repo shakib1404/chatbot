@@ -6,7 +6,7 @@ import streamlit as st
 
 from config import OLLAMA_CONTEXT_TURNS
 from db import save_message, get_chat_history, get_user_stats
-from ollama_client import query as ollama_query, format_ts
+from ollama_client import query as ollama_query, query_streaming, format_ts
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
@@ -14,13 +14,52 @@ from ollama_client import query as ollama_query, format_ts
 def render_chat() -> None:
     if "stop_generation" not in st.session_state:
         st.session_state.stop_generation = False
+    if "input_text" not in st.session_state:
+        st.session_state.input_text = ""
 
     _render_sidebar()
     _render_header()
 
     history = get_chat_history(st.session_state.username)
-    _render_messages(history)
-    _handle_input(history)
+    pending = st.session_state.get("pending_prompt")
+
+    # ── 1. Render all history messages ────────────────────────────────────────
+    _render_all_messages(history, inject_user_msg=pending)
+
+    # ── 2. If pending → generate reply right here, in this same run ──────────
+    if pending:
+        # IMPORTANT: Clear pending immediately so it doesn't execute again on rerun
+        st.session_state.pending_prompt = None
+        
+        # If stop was already clicked, skip streaming and show input box
+        if st.session_state.get("stop_generation"):
+            st.session_state.stop_generation = False
+            st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+            _render_input_box()
+            return
+        
+        # Save the user message
+        save_message(st.session_state.username, "user", pending)
+
+        ollama_msgs = [
+            {"role": m["role"], "content": m["content"]}
+            for m in history[-OLLAMA_CONTEXT_TURNS:]
+        ] + [{"role": "user", "content": pending}]
+
+        reply, was_stopped = _stream_response(ollama_msgs)
+        
+        # Only save if we got a response
+        if reply.strip():
+            save_message(st.session_state.username, "assistant", reply)
+        
+        # Reset flag and show input box
+        st.session_state.stop_generation = False
+        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+        _render_input_box()
+        return
+
+    # ── 3. Input box (only shown when idle) ───────────────────────────────────
+    _render_input_box()
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -106,25 +145,6 @@ def _render_header() -> None:
 
 # ── Message rendering ─────────────────────────────────────────────────────────
 
-def _render_messages(history: list[dict]) -> None:
-    st.markdown("<div class='chat-container'>", unsafe_allow_html=True)
-
-    if not history:
-        st.markdown("""
-        <div style='text-align:center;padding:60px 0;'>
-            <div style='font-size:2.5rem;margin-bottom:12px;'>⚡</div>
-            <div style='font-family:var(--mono);font-size:0.85rem;color:var(--muted);'>
-                No messages yet.<br>Ask anything below.
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        for msg in history:
-            _render_bubble(msg)
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
 def _render_bubble(msg: dict) -> None:
     role         = msg["role"]
     content      = msg["content"]
@@ -146,57 +166,73 @@ def _render_bubble(msg: dict) -> None:
     """, unsafe_allow_html=True)
 
 
-# ── Input + state machine ─────────────────────────────────────────────────────
+def _render_all_messages(history: list[dict], inject_user_msg: str | None = None) -> None:
+    st.markdown("<div class='chat-container'>", unsafe_allow_html=True)
 
-def _handle_input(history: list[dict]) -> None:
-    prompt = st.chat_input("Ask Mistral anything…")
-    if not prompt:
-        return
+    if not history and not inject_user_msg:
+        st.markdown("""
+        <div style='text-align:center;padding:60px 0;'>
+            <div style='font-size:2.5rem;margin-bottom:12px;'>⚡</div>
+            <div style='font-family:var(--mono);font-size:0.85rem;color:var(--muted);'>
+                No messages yet.<br>Ask anything below.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        for msg in history:
+            _render_bubble(msg)
+        # Inject the in-flight user bubble — appears on the RIGHT immediately
+        if inject_user_msg:
+            _render_bubble({
+                "role": "user",
+                "content": inject_user_msg,
+                "timestamp": datetime.now(),
+            })
 
-    st.session_state.stop_generation = False
-
-    # Render the new user message immediately on the right in the same run.
-    _render_bubble({
-        "role": "user",
-        "content": prompt,
-        "timestamp": datetime.now(),
-    })
-
-    # Build the Ollama context from the existing history plus the new prompt.
-    live_history = history + [{"role": "user", "content": prompt}]
-    save_message(st.session_state.username, "user", prompt)
-    _do_generate(prompt, live_history)
-
-
-# ── Generation ────────────────────────────────────────────────────────────────
-
-def _do_generate(prompt: str, history: list[dict]) -> None:
-    ollama_msgs = [
-        {"role": m["role"], "content": m["content"]}
-        for m in history[-OLLAMA_CONTEXT_TURNS:]
-    ]
-    # Guard: ensure the new prompt is the last message sent to Ollama
-    if not ollama_msgs or ollama_msgs[-1]["content"] != prompt:
-        ollama_msgs.append({"role": "user", "content": prompt})
-
-    reply = _stream_response(ollama_msgs)
-    save_message(st.session_state.username, "assistant", reply)
-    st.rerun()   # → IDLE
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
-def _stream_response(ollama_msgs: list[dict]) -> str:
+# ── Custom input box ──────────────────────────────────────────────────────────
+
+def _render_input_box() -> None:
     """
-    Fetch from Ollama, animate word-by-word, support stop via on_click callback.
-
-    Why on_click?
-    Streamlit processes button clicks only on the rerun they trigger.
-    A plain `if st.button(...)` cannot interrupt a running loop in the SAME
-    execution.  Using `on_click=_set_stop` writes the flag into session_state
-    BEFORE the script body reruns, so the loop sees it True at its very first
-    iteration on that rerun → effectively instant stop.
+    Replaces st.chat_input with a plain text_input + button.
+    st.chat_input is bottom-anchored and interferes with render order.
+    This custom box sits naturally below the messages in DOM order.
     """
+    st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
 
-    # Typing indicator
+    col_input, col_btn = st.columns([8, 1])
+
+    def _submit_prompt() -> None:
+        prompt = st.session_state.get("input_text", "").strip()
+        if not prompt:
+            return
+        st.session_state.pending_prompt = prompt
+        st.session_state.stop_generation = False
+        st.session_state.input_text = ""
+
+    with col_input:
+        user_text = st.text_input(
+            label="chat_input",
+            label_visibility="collapsed",
+            placeholder="Ask Mistral anything…",
+            key="input_text",
+            on_change=_submit_prompt,
+        )
+
+    with col_btn:
+        st.button("➤", key="send_btn", use_container_width=True, on_click=_submit_prompt)
+
+
+# ── Streaming / animation ─────────────────────────────────────────────────────
+
+def _stream_response(ollama_msgs: list[dict]) -> tuple[str, bool]:
+    """
+    Stream response from model and return (text, was_stopped).
+    Returns a tuple with the response text and whether it was stopped.
+    """
+    # Typing indicator placeholder
     placeholder = st.empty()
     placeholder.markdown("""
     <div class='msg-row'>
@@ -209,12 +245,9 @@ def _stream_response(ollama_msgs: list[dict]) -> str:
     </div>
     """, unsafe_allow_html=True)
 
-    with st.spinner(""):
-        reply = ollama_query(ollama_msgs)
-
     ts = format_ts(datetime.now())
 
-    # Stop button BEFORE animation so layout doesn't jump
+    # Stop button — rendered BEFORE streaming starts
     def _set_stop():
         st.session_state.stop_generation = True
 
@@ -222,28 +255,46 @@ def _stream_response(ollama_msgs: list[dict]) -> str:
     with stop_col:
         st.button("■ STOP", key="stop_btn", on_click=_set_stop, type="secondary")
 
-    # Word-by-word animation
-    shown:  list[str] = []
+    # Stream response word-by-word
+    shown: list[str] = []
     stopped = False
 
-    for word in reply.split(" "):
-        if st.session_state.get("stop_generation"):
-            stopped = True
-            break
+    def _should_stop():
+        """Check if stop flag is set."""
+        return st.session_state.get("stop_generation", False)
 
-        shown.append(word)
-        placeholder.markdown(f"""
-        <div class='msg-row'>
-            <div class='avatar bot'>AI</div>
-            <div class='bubble bot'>
-                {" ".join(shown)}<span style='opacity:0.4;'>▌</span>
-                <span class='ts'>{ts}</span>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-        time.sleep(0.04)
+    try:
+        for chunk in query_streaming(ollama_msgs, should_stop_func=_should_stop):
+            if st.session_state.get("stop_generation"):
+                stopped = True
+                break
+            
+            # Accumulate words from the chunk
+            words = chunk.split(" ")
+            for word in words:
+                if not word:
+                    continue
+                if st.session_state.get("stop_generation"):
+                    stopped = True
+                    break
+                
+                shown.append(word)
+                placeholder.markdown(f"""
+                <div class='msg-row'>
+                    <div class='avatar bot'>AI</div>
+                    <div class='bubble bot'>
+                        {" ".join(shown)}<span style='opacity:0.4;'>▌</span>
+                        <span class='ts'>{ts}</span>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                time.sleep(0.02)
+            
+            if stopped:
+                break
+    except Exception as e:
+        shown.append(f"❌ Error: {str(e)}")
 
-    # Final render
     final_text = " ".join(shown)
     if stopped:
         final_text += (
@@ -261,5 +312,4 @@ def _stream_response(ollama_msgs: list[dict]) -> str:
     </div>
     """, unsafe_allow_html=True)
 
-    st.session_state.stop_generation = False
-    return " ".join(shown)
+    return final_text, stopped
