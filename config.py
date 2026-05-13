@@ -15,6 +15,9 @@ OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "300"))
 # How many turns of history to send to Ollama
 OLLAMA_CONTEXT_TURNS = 20
 
+# With summary mode enabled, only recent turns are included directly.
+SUMMARY_RECENT_TURNS = int(os.getenv("SUMMARY_RECENT_TURNS", "6"))
+
 # Streamlit page config (consumed by app.py)
 PAGE_CONFIG = dict(
     page_title="NeuralChat · AI Assistant",
@@ -29,4 +32,6 @@ SESSION_DEFAULTS: dict = {
     "username":   "",
     "page":       "login",
     "active_tab": "chat",
+    "active_chat_id": "",
+    "active_chat_title": "",
 }

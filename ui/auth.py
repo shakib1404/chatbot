@@ -38,6 +38,8 @@ def _render_sign_in() -> None:
             st.session_state.logged_in = True
             st.session_state.username  = uname
             st.session_state.page      = "chat"
+            st.session_state.active_chat_id = ""
+            st.session_state.active_chat_title = ""
             st.rerun()
         else:
             st.error("Invalid credentials.")
